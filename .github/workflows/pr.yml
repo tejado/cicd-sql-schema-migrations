@@ -1,0 +1,184 @@
+name: PR
+
+# Controls when the workflow will run
+on:
+  pull_request:
+    branches:
+    - master
+    
+env:
+  LABEL_NAME: 'database:change'
+  LABEL_COLOR: 'FF0000'
+
+# A workflow run is made up of one or more jobs that can run sequentially or in parallel
+jobs:
+  skeema-diff:
+    name: Database Skeema Diff
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup MySQL
+        uses: mirromutth/mysql-action@de1fba8b3f90ce8db80f663a7043be3cf3231248
+        with:
+          host port: 3306
+          container port: 3306
+          character set server: utf8mb4
+          collation server: utf8mb4_general_ci
+          mysql version: latest
+          mysql database: testDB
+          mysql root password: root
+
+      - uses: actions/checkout@v2
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          
+      - name: Set up Go 1.15
+        uses: actions/setup-go@v2.2.0
+        with:
+          go-version: 1.15
+        id: go
+        
+      - name: Skeema - Install
+        run: |
+          SKEEMA_JSON=$(curl -s "https://api.github.com/repos/skeema/skeema/releases/latest") 
+          SKEEMA_URL=$(echo $SKEEMA_JSON | jq -r '.assets[].browser_download_url | select(contains("linux_amd64"))')
+
+          TARGET="/tmp/skeema.tar.gz"
+          curl -fsSL --compressed "$SKEEMA_URL" -o "$TARGET"
+
+          tar -xf "$TARGET" -C "/tmp"
+
+      - name: Skeema - Create Config
+        env:
+          SKEEMA_CONFIG_NAME: temp
+          SCHEMA_FOLDER: schema
+          MYSQL_FLAVOR: mysql:8.0
+          MYSQL_HOST: 127.0.0.1
+          MYSQL_PORT: 3306
+          MYSQL_USER: root
+          MYSQL_CHARACTER_SET: utf8mb4
+          MYSQL_COLLATION: utf8mb4_bin
+          MYSQL_SCHEMA: ${{ secrets.MYSQL_SCHEMA }}
+        run: |
+          printf '[%s]\nflavor=%s\nhost=%s\nport=%s\nuser=%s\nschema=%s\ndefault-character-set=%s\ndefault-collation=%s' "${SKEEMA_CONFIG_NAME}" "${MYSQL_FLAVOR}" "${MYSQL_HOST}" "${MYSQL_PORT}" "${MYSQL_USER}" "${MYSQL_SCHEMA}" "${MYSQL_CHARACTER_SET}" "${MYSQL_COLLATION}" > ${SCHEMA_FOLDER}/.skeema
+          cat ${SCHEMA_FOLDER}/.skeema
+
+      - name: Skeema - Push
+        env:
+          MYSQL_PWD: root
+        run: |    
+          n=0
+          until [ "$n" -ge 10 ]
+          do
+             /tmp/skeema push temp && break             
+             n=$((n+1)) 
+             sleep 5
+          done
+          
+      - uses: actions/checkout@v2
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          
+      - name: Skeema - Create Config
+        env:
+          SKEEMA_CONFIG_NAME: temp
+          SCHEMA_FOLDER: schema
+          MYSQL_FLAVOR: mysql:8.0
+          MYSQL_HOST: 127.0.0.1
+          MYSQL_PORT: 3306
+          MYSQL_USER: root
+          MYSQL_CHARACTER_SET: utf8mb4
+          MYSQL_COLLATION: utf8mb4_bin
+          MYSQL_SCHEMA: ${{ secrets.MYSQL_SCHEMA }}
+        run: |
+          printf '[%s]\nflavor=%s\nhost=%s\nport=%s\nuser=%s\nschema=%s\ndefault-character-set=%s\ndefault-collation=%s' "${SKEEMA_CONFIG_NAME}" "${MYSQL_FLAVOR}" "${MYSQL_HOST}" "${MYSQL_PORT}" "${MYSQL_USER}" "${MYSQL_SCHEMA}" "${MYSQL_CHARACTER_SET}" "${MYSQL_COLLATION}" > ${SCHEMA_FOLDER}/.skeema
+          cat ${SCHEMA_FOLDER}/.skeema
+        
+      - name: Skeema - Generate commented diff
+        env:
+          MYSQL_PWD: root
+        run: |         
+          /tmp/skeema push temp --allow-unsafe --ddl-wrapper='echo "\n-- skeema:ddl:begin\n"{DDL}";\n-- skeema:ddl:end"' | sed -e 's/^USE /-- skeema:ddl:use /g' | sed -n '/^-- skeema:ddl:use /p;/^-- skeema:ddl:begin/,/^-- skeema:ddl:end/p' | tee /tmp/skeema-diff.sql
+        
+      - name: Validate diff
+        run: |
+          count_schemas_changed="$(egrep -c '^-- skeema:ddl:use' /tmp/skeema-diff.sql || :)"
+          echo "diff validation: ${count_schemas_changed} schemas changed."
+          
+          if [ $count_schemas_changed -gt 1 ] ; then
+            echo "Multiple schemas changed. Not supported!"
+            exit 1
+          fi
+          
+      - name: Check label
+        # See if the label already exists. This helps with later bookkeeping.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          if [ -z ${LABEL_NAME+x} ] || [ -z ${LABEL_COLOR+x} ] ; then
+            echo "Configuration error: env LABEL_NAME and/or LABEL_COLOR are not set"
+            exit 1
+          fi
+          
+          gh api --silent repos/:owner/:repo/labels -f name="${LABEL_NAME}" -f color="${LABEL_COLOR}" || :
+          gh pr view ${PR_NUMBER} --json labels -q '.[].[].name' | grep -q "${LABEL_NAME}" && touch /tmp/skeema-diff-label-detected.hint || :
+          
+      - name: Create PR label
+        # Is there a schema diff? Was there previously a diff? Indicate the situation with labels.
+        # Also, generate flag files to be used later for bookkeeping.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          skeema_diff="$(cat /tmp/skeema-diff.sql)"
+          if [ -n "$skeema_diff" ] ; then
+            # There is a schema change
+            if [ ! -f /tmp/skeema-diff-label-detected.hint ] ; then
+              gh pr edit ${PR_NUMBER} --add-label "${LABEL_NAME}"
+              touch /tmp/skeema-diff-label-created.hint
+            fi
+          else
+            if [ -f /tmp/skeema-diff-label-detected.hint ] ; then
+              # remove existing label
+              gh pr edit ${PR_NUMBER} --remove-label "${LABEL_NAME}" || :
+              touch /tmp/skeema-diff-label-removed.hint
+            fi
+          fi
+          
+      - name: Comment PR
+        # Do two things:
+        # - Add a new comment reflecting the change in this PR (the schema change if any, or lack thereof)
+        # - Update the PR body (the original comment) to reflect the change in this PR (the schema change if any, or lack thereof)
+        #   This requires some manipulation of the body. We don't want to destroy the developer's comment; we append to it, overwriting
+        #   any previously text generated by this Action.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          skeema_diff="$(cat /tmp/skeema-diff.sql)"
+          if [ -z "${skeema_diff}" ] && [ ! -f /tmp/skeema-diff-label-detected.hint ] ; then
+            # There is no schema change; there hasn't been one previously.
+            exit 0
+          fi
+          
+          magic_comment_hint="<!-- skeema:magic:comment -->"
+          magic_comment_id=$(gh api "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments?per_page=100" -q ".[] | select(.body | startswith(\"${magic_comment_hint}\")) | .id" | head -n 1)
+          comment_body="something"
+          if [ -f /tmp/skeema-diff-label-removed.hint ] ; then
+            # There used to be a schema change, now there isn't
+            comment_body="$(printf -- "$magic_comment_hint\nDatabase diff cleared as this PR does not contain any schema changes (anymore)!")"
+          else
+            # There is a skeema diff
+            author="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" -q '.user.login')"
+            comment_body="$(printf -- "$magic_comment_hint\n@${author} it looks like you are making database schema changes. Generated diff by skeema:\n\`\`\`-- skeema:diff\n${skeema_diff}\n\`\`\`")"
+          fi
+          
+          if [ -z "$magic_comment_id" ] ; then
+            # First time, add new comment           
+            gh pr comment ${PR_NUMBER} --body "${comment_body}"
+          else
+            # Magic comment exists. Edit it.
+            gh api --method PATCH "repos/${GITHUB_REPOSITORY}/issues/comments/${magic_comment_id}" --raw-field "body=${comment_body}"
+          fi
+          
+

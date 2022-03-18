@@ -1,0 +1,121 @@
+name: Deployment
+
+# Controls when the workflow will run
+on:
+  push:
+    branches: [ master ]
+    paths:
+      - 'schema/**.sql'
+
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
+
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+         
+      - name: Skeema - Install
+        run: |
+          SKEEMA_JSON=$(curl -s "https://api.github.com/repos/skeema/skeema/releases/latest") 
+          SKEEMA_URL=$(echo $SKEEMA_JSON | jq -r '.assets[].browser_download_url | select(contains("linux_amd64"))')
+
+          TARGET="/tmp/skeema.tar.gz"
+          curl -fsSL --compressed "$SKEEMA_URL" -o "$TARGET"
+
+          tar -xf "$TARGET" -C "/tmp"
+
+      - name: Install gh-ost
+        run: |
+          GHOST_JSON=$(curl -s "https://api.github.com/repos/github/gh-ost/releases/latest") 
+
+          GHOST_URL=$(echo $GHOST_JSON | jq -r '.assets[].browser_download_url | select(contains("linux"))')
+          GHOST_HASH=$(echo $GHOST_JSON | grep -Pso '(?<=\S)([a-f0-9]{64})(?=(\s+?)gh-ost-binary-linux-(.*?).tar.gz)')
+
+          TARGET="/tmp/gh-ost.tar.gz"
+          curl -fsSL --compressed "$GHOST_URL" -o "$TARGET"
+
+          echo "${GHOST_HASH} ${TARGET}" | sha256sum -c --status
+          (($? != 0)) && { printf '%s\n' "sha256sum exited with non-zero - wrong hash or file not found"; exit 1; }
+
+          tar -xf "$TARGET" -C "/tmp"
+        
+      - name: Skeema - Create Config
+        env:
+          SKEEMA_CONFIG_NAME: production
+          SCHEMA_FOLDER: schema
+          MYSQL_FLAVOR: mysql:8.0
+          MYSQL_CHARACTER_SET: utf8mb4
+          MYSQL_COLLATION: utf8mb4_bin
+          MYSQL_HOST: ${{ secrets.MYSQL_PRODUCTION_HOST }}
+          MYSQL_PORT: ${{ secrets.MYSQL_PRODUCTION_PORT }}
+          MYSQL_USER: ${{ secrets.MYSQL_PRODUCTION_USERNAME }}
+          MYSQL_SCHEMA: ${{ secrets.MYSQL_SCHEMA }}
+        run: |
+          printf '[%s]\nflavor=%s\nhost=%s\nport=%s\nuser=%s\nschema=%s\ndefault-character-set=%s\ndefault-collation=%s' "${SKEEMA_CONFIG_NAME}" "${MYSQL_FLAVOR}" "${MYSQL_HOST}" "${MYSQL_PORT}" "${MYSQL_USER}" "${MYSQL_SCHEMA}" "${MYSQL_CHARACTER_SET}" "${MYSQL_COLLATION}" > ${SCHEMA_FOLDER}/.skeema
+          cat ${SCHEMA_FOLDER}/.skeema
+                   
+      - name: Skeema - Generate commented diff
+        env:
+          MYSQL_PWD: ${{ secrets.MYSQL_PRODUCTION_PASSWORD }}
+        run: |
+          /tmp/skeema push production --allow-unsafe --ddl-wrapper='echo "\n-- skeema:ddl:begin\n"{DDL}";\n-- skeema:ddl:end"' | sed -e 's/^USE /-- skeema:ddl:use /g' | sed -n '/^-- skeema:ddl:use /p;/^-- skeema:ddl:begin/,/^-- skeema:ddl:end/p' | tee /tmp/skeema-diff.sql
+        
+      - name: Database schema migration
+        env:
+          MYSQL_HOST: ${{ secrets.MYSQL_PRODUCTION_HOST }}
+          MYSQL_PORT: ${{ secrets.MYSQL_PRODUCTION_PORT }}
+          MYSQL_USER: ${{ secrets.MYSQL_PRODUCTION_USERNAME }}
+          MYSQL_PWD: ${{ secrets.MYSQL_PRODUCTION_PASSWORD }}
+          MYSQL_SCHEMA: ${{ secrets.MYSQL_SCHEMA }}
+        run: |
+          skeema_diff="$(cat /tmp/skeema-diff.sql)"
+
+          statements=`echo $skeema_diff | grep -Po "(?s)(?<=-- skeema:ddl:begin\s)(.*?)(?=\s-- skeema:ddl:end)"`
+          shopt -s nocasematch
+
+          while IFS= read -r statement
+          do 
+            if [[ $statement =~ (^CREATE TABLE.*) || $statement =~ (^DROP TABLE.*$) ]]
+              then
+                  echo "simple (direct execution): $statement"
+                  mysql --verbose --host="${MYSQL_HOST}" --port="${MYSQL_PORT}" --user="${MYSQL_USER}" --database="${MYSQL_SCHEMA}" --execute="$statement"
+                  
+              elif  [[ $statement =~ (^ALTER TABLE.*) ]]
+              then
+                  echo "complex (gh-ost): $statement"
+                  tablename=`echo $statement | grep -Po '(?<=ALTER TABLE \`)(.*?)(?=\`)'`
+                  echo $tablename
+                  
+                  /tmp/gh-ost \
+                    --assume-rbr \
+                    --azure \
+                    --max-load=Threads_running=25 \
+                    --critical-load=Threads_running=1000 \
+                    --chunk-size=1000 \
+                    --max-lag-millis=1500 \
+                    --user="${MYSQL_USER}" \
+                    --password="${MYSQL_PWD}" \
+                    --host="${MYSQL_HOST}" \
+                    --allow-on-master \
+                    --database="${MYSQL_SCHEMA}" \
+                    --table="$tablename" \
+                    --verbose \
+                    --alter="$statement" \
+                    --allow-master-master \
+                    --cut-over=default \
+                    --exact-rowcount \
+                    --concurrent-rowcount \
+                    --default-retries=120 \
+                    --panic-flag-file=/tmp/ghost.panic.flag \
+                    --initially-drop-ghost-table \
+                    --initially-drop-old-table \
+                    --ok-to-drop-table \
+                    --execute
+                  
+              else
+                  echo "unknown: $statement"
+              fi
+          done <<< "$statements"
