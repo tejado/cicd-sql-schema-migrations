@@ -67,8 +67,7 @@ After setting up the prerequisites, you can suggest any changes over a pull requ
 
 If you approve and merge the changes into your master branch, the deployment pipeline will start and executes gh-ost for ALTER TABLE statements on your configured database. CREATE TABLE or DROP TABLE statements are "simple" SQL changes and will NOT be executed with gh-ost.
 
-TODO: improve this section!
-
+> **_NOTE:_** The pipelines are defined in the [.github/workflows](https://github.com/tejado/cicd-sql-schema-migrations/tree/master/.github/workflows) folder. Because automated release and deployment processes (continuous deployment) combine your technology stack and requirements with the processual circumstances, they can differ greatly from application to application. If you introduce this process into your environment, think it through carefully and don't adopt it 1:1!
 
 ## Limitations
 - Currently only for MySQL on Azure (the pipelines can be easily adjusted for non-Azure databases)
@@ -76,7 +75,7 @@ TODO: improve this section!
 - Your database needs to be reachable by GitHub Actions. If you are using an isolated network for your database, you can use GitHub Actions on [self-hosted runners](https://docs.github.com/en/actions/hosting-your-own-runners/about-self-hosted-runners).
 
 ## References
-https://github.blog/2020-02-14-automating-mysql-schema-migrations-with-github-actions-and-more/
-https://github.com/skeema/skeema
-https://github.com/github/gh-ost
-https://github.com/github/gh-mysql-tools/tree/master/skeefree
+- [Automating MySQL schema migrations with GitHub Actions and more](https://github.blog/2020-02-14-automating-mysql-schema-migrations-with-github-actions-and-more/)
+- [skeema GitHub repo](https://github.com/skeema/skeema)
+- [gh-ost GitHub repo](https://github.com/github/gh-ost)
+- [gh-mysql-tools GitHub repo](https://github.com/github/gh-mysql-tools/tree/master/skeefree)
